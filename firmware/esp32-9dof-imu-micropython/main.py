@@ -24,11 +24,11 @@ Button 1 (BTN_START_DISARM_PIN): starts the arm sequence; press again at
        it -- same reasoning as not overlapping voice cues with sampling
        elsewhere: speaker vibration during calibration would corrupt the
        gravity baseline). LED keeps blinking. Car must be completely
-       still. Samples during this window are recorded (they become the
-       start of the exported CSV) and used to compute a gravity baseline
-       + vibration-noise deadzone, printed to Serial at the end (same
-       numbers analysis/analyze_run.py would derive from the same window,
-       just also visible live here).
+       still. Samples during this window feed only the on-device gravity
+       baseline + vibration-noise deadzone diagnostic (printed to Serial
+       at the end) -- they are NOT part of the exported CSV (see
+       _collect_calibration_samples()); the export starts fresh at real
+       recording, not at calibration.
     3. COUNTDOWN -- three low countdown beeps one second apart, then a
        higher-pitched "go" beep. Sampling is deliberately *not* drained
        into the exported buffer during this phase (see
@@ -37,11 +37,18 @@ Button 1 (BTN_START_DISARM_PIN): starts the arm sequence; press again at
        when the car is released and the data matters most. The native
        sampler keeps running underneath regardless (it always does), but
        whatever it produces during this phase is discarded rather than
-       exported, so the CSV has a real timestamp gap here rather than
-       vibration-contaminated readings.
+       exported. Because calibration data is also excluded (see above),
+       none of this shows up as a gap in the exported CSV either -- t=0
+       there is the first real post-countdown sample, continuous from
+       then on.
     4. RECORDING -- LED solid on. Release the car once you hear "go".
        Sampling resumes (fresh, post-countdown) until disarmed or the
-       buffer fills.
+       buffer fills. t=0 for the exported CSV is set right here (see
+       _start_recording_worker()), not at calibration -- a deliberate
+       change from an earlier version, made after real hardware data
+       showed the old calibration-then-countdown-gap-then-recording
+       layout looked like a confusing, unexplained hole in the middle of
+       the exported timeline.
 Button 2 (BTN_RESET_PIN): stops recording (if running) and clears the
   buffer, ready for a new experiment.
 Button 3 (BTN_EXPORT_PIN): while disarmed and the buffer holds samples,
@@ -269,17 +276,18 @@ roll_buf, pitch_buf, yaw_buf = _alloc_f(), _alloc_f(), _alloc_f()
 
 sample_count = 0
 
-# Small scratch buffers used only to drain-and-discard the native sampler's
-# queue during STATE_COUNTDOWN (see _flush_native_queue() below) -- kept
-# separate from the real t_ms_buf/etc. above since sample_count is already
-# nonzero by then (calibration-phase samples are legitimately part of the
-# export), so flushing can't reuse index 0 the way an earlier draft of this
-# assumed. 300 comfortably covers the native queue's own 250-sample/5s cap
-# (QUEUE_LEN in sampler_task.c) in a single pull() call, with margin.
-_FLUSH_SCRATCH_LEN = 300
-_flush_t_buf = array.array("I", bytes(4 * _FLUSH_SCRATCH_LEN))
-_flush_gx_buf, _flush_gy_buf, _flush_gz_buf = array.array("f", bytes(4 * _FLUSH_SCRATCH_LEN)), array.array("f", bytes(4 * _FLUSH_SCRATCH_LEN)), array.array("f", bytes(4 * _FLUSH_SCRATCH_LEN))
-_flush_ax_buf, _flush_ay_buf, _flush_az_buf = array.array("f", bytes(4 * _FLUSH_SCRATCH_LEN)), array.array("f", bytes(4 * _FLUSH_SCRATCH_LEN)), array.array("f", bytes(4 * _FLUSH_SCRATCH_LEN))
+# Small scratch buffers used to pull samples out of the native queue
+# without touching the real t_ms_buf/etc. above (or sample_count) --
+# shared by _flush_native_queue() (discards everything, during
+# STATE_COUNTDOWN) and _collect_calibration_samples() (keeps the ax/ay/az
+# values, during STATE_CALIBRATING), never both at once. 300 comfortably
+# covers the countdown's ~165-sample worst case in a single pull() call
+# (with margin), well under the native queue's own 1000-sample/20s cap
+# (QUEUE_LEN in sampler_task.c) either way.
+_SCRATCH_LEN = 300
+_scratch_t_buf = array.array("I", bytes(4 * _SCRATCH_LEN))
+_scratch_gx_buf, _scratch_gy_buf, _scratch_gz_buf = array.array("f", bytes(4 * _SCRATCH_LEN)), array.array("f", bytes(4 * _SCRATCH_LEN)), array.array("f", bytes(4 * _SCRATCH_LEN))
+_scratch_ax_buf, _scratch_ay_buf, _scratch_az_buf = array.array("f", bytes(4 * _SCRATCH_LEN)), array.array("f", bytes(4 * _SCRATCH_LEN)), array.array("f", bytes(4 * _SCRATCH_LEN))
 
 
 def _flush_native_queue():
@@ -288,18 +296,43 @@ def _flush_native_queue():
     Python state (it always has -- see native/README.md), so without this,
     the beeps' own speaker vibration would silently become the first ~3s
     of the actual recording the moment drain_samples() resumes. Loops
-    because a single pull() call only returns up to len(_flush_t_buf)
+    because a single pull() call only returns up to len(_scratch_t_buf)
     samples -- one call is enough in practice (300 > the countdown's
     ~165-sample worst case), but looping to a real 0 makes that a safety
     margin rather than a hard assumption."""
     while True:
         n = imu_native.pull(
-            _flush_t_buf, _flush_gx_buf, _flush_gy_buf, _flush_gz_buf,
-            _flush_ax_buf, _flush_ay_buf, _flush_az_buf,
-            0, _FLUSH_SCRATCH_LEN,
+            _scratch_t_buf, _scratch_gx_buf, _scratch_gy_buf, _scratch_gz_buf,
+            _scratch_ax_buf, _scratch_ay_buf, _scratch_az_buf,
+            0, _SCRATCH_LEN,
         )
         if n == 0:
             break
+
+
+def _collect_calibration_samples():
+    """Pulls whatever the native sampler has produced since the last call
+    and appends each (ax, ay, az) reading to calibration_samples --
+    deliberately NOT through drain_samples()/sample_count, so
+    calibration-phase data (the car sitting still, before the countdown
+    even starts) never becomes part of the exported CSV. It used to:
+    t0_native_ms was set at the start of calibration, and the countdown's
+    own discarded window (_flush_native_queue()) landed in the middle of
+    the exported timeline, showing up as a confusing ~3.5s gap between two
+    kinds of "real" data (calibration, then the actual recording) instead
+    of a clean recording that starts at t=0. Real hardware data across
+    several test runs confirmed this gap was exactly the by-design
+    countdown discard, misplaced -- not sample loss. calibration_samples
+    is still used for the on-device gravity/deadzone diagnostic print in
+    finish_calibration_and_start_recording(); it just no longer shares
+    storage with the exported buffers."""
+    n = imu_native.pull(
+        _scratch_t_buf, _scratch_gx_buf, _scratch_gy_buf, _scratch_gz_buf,
+        _scratch_ax_buf, _scratch_ay_buf, _scratch_az_buf,
+        0, _SCRATCH_LEN,
+    )
+    for i in range(n):
+        calibration_samples.append((_scratch_ax_buf[i], _scratch_ay_buf[i], _scratch_az_buf[i]))
 
 STATE_IDLE = "IDLE"
 STATE_ARM_DELAY = "ARM_DELAY"
@@ -427,11 +460,13 @@ def _start_recording_worker(session_id):
     the beeps right before flipping to STATE_RECORDING, so draining starts
     clean from the "go" moment rather than replaying ~3s of beep-tainted
     data as if it were the start of the run."""
-    global state, polling_thread_active
+    global state, polling_thread_active, t0_native_ms, _last_relative_t_ms
     countdown_and_go()
     if session_id != _recording_session_id or state != STATE_COUNTDOWN:
         return  # disarmed (or superseded) while the countdown was playing
     _flush_native_queue()
+    t0_native_ms = imu_native.now_ms()  # t=0 for exported timestamps -- see start_calibration()'s docstring
+    _last_relative_t_ms = None  # re-seed orientation from the first real recording sample, not calibration's last one
     state = STATE_RECORDING
     update_oled("recording")
     print("[state] RECORDING -- release it now")
@@ -818,6 +853,13 @@ def begin_arm_sequence():
         return
 
     # Stop remote-command polling before the timing-sensitive phase begins.
+    # (Briefly removed this call while chasing a ~3.5s gap in every
+    # exported recording, suspecting a cold WiFi/TLS reconnect was
+    # starving the sampler. It wasn't -- the gap persisted identically
+    # with this line removed, proving WiFi timing was never the cause; see
+    # start_calibration()/finish_calibration_and_start_recording() for the
+    # real fix. Restored, since there's no reason left to take on an
+    # unproven RF-interference-during-calibration risk.)
     network.WLAN(network.STA_IF).active(False)
 
     state = STATE_ARM_DELAY
@@ -842,29 +884,25 @@ def start_calibration():
     *then* starts the actual hold-still window -- not concurrently with
     the clip, since speaker vibration during calibration would corrupt
     the gravity baseline (same reasoning as never overlapping a voice cue
-    with a sampling window that matters). Sampling (into the main buffer)
-    starts once the clip finishes -- record_start_ms/t0_native_ms (t=0 for
-    exported timestamps) are set then, not at the original button press,
-    so the calibration window lines up with the start of the exported CSV
-    exactly like analyze_run.py expects. Orientation is seeded from
-    whichever sample drain_samples() accepts first for this experiment
-    (see _last_relative_t_ms=None below), not a synchronous read here --
-    there's no such thing anymore now that all reads go through the
-    native queue.
+    with a sampling window that matters). Calibration-phase samples feed
+    only the on-device gravity/deadzone diagnostic (calibration_samples,
+    via _collect_calibration_samples()) -- t0_native_ms (t=0 for exported
+    timestamps) isn't set until real recording actually starts, in
+    _start_recording_worker(), so the exported CSV contains only real
+    (post-countdown) recording data, gap-free from t=0.
 
-    _flush_native_queue() right before that fresh start matters here too,
+    _flush_native_queue() right before this fresh start matters here too,
     not just at the COUNTDOWN->RECORDING handoff: the native sampler never
     stops producing samples, including through the entire idle period
     before arming, the "place" voice, the whole ARM_PLACEMENT_DELAY_SECONDS
     window, and the "calibrate" voice just played above -- none of that is
     drained anywhere, so without a flush here, calibration would start by
     consuming whatever stale backlog happens to be sitting in the queue
-    (up to its own ~5s cap) rather than genuinely fresh samples. That
-    backlog could include real vibration from any of those sources,
-    including a previous experiment's disarm beep if the queue was still
-    holding it from before this idle period even began."""
-    global state, record_start_ms, t0_native_ms, calibration_deadline_ms
-    global calibration_samples, _last_relative_t_ms
+    (up to its own cap) rather than genuinely fresh samples. That backlog
+    could include real vibration from any of those sources, including a
+    previous experiment's disarm beep if the queue was still holding it
+    from before this idle period even began."""
+    global state, record_start_ms, calibration_deadline_ms, calibration_samples
 
     state = STATE_CALIBRATING
     update_oled("hold still")
@@ -873,8 +911,6 @@ def start_calibration():
 
     now = utime.ticks_ms()
     record_start_ms = now
-    t0_native_ms = imu_native.now_ms()
-    _last_relative_t_ms = None
     calibration_deadline_ms = utime.ticks_add(now, int(CALIBRATION_SECONDS * 1000))
     calibration_samples = []
     print("[state] CALIBRATING, hold still (%.1fs)" % CALIBRATION_SECONDS)
@@ -888,16 +924,27 @@ def finish_calibration_and_start_recording():
     Sampling itself needs nothing done here at all -- it's a native FreeRTOS
     task that's been running continuously and uninterrupted since boot,
     completely independent of this state transition or anything else Python
-    does. (This used to need real care: the countdown beeps, "go" beep, and
-    WiFi reconnect ran right here and blocked the main loop for several
-    seconds, silently dropping every sample that should have landed during
-    that window -- confirmed on real exported CSVs as a multi-second hole
-    in timestamp_ms right at the calibration/recording boundary. That whole
-    class of bug is structurally impossible now: there's no main-loop timing
-    for anything to block.) The countdown/WiFi/polling handoff still runs on
-    a separate thread (_start_recording_worker) so it doesn't stall button
-    handling, same reasoning as _recording_poll_worker -- just no longer
-    load-bearing for sample integrity the way it used to be."""
+    does. The countdown/WiFi/polling handoff runs on a separate thread
+    (_start_recording_worker) so it doesn't stall button handling, same
+    reasoning as _recording_poll_worker.
+
+    Correction to a claim this docstring used to make: moving that handoff
+    to its own thread does NOT, by itself, prevent a gap in the exported
+    CSV around the calibration/recording boundary -- real hardware data
+    (several separate test runs, even after quadrupling the native
+    sampler's queue depth) kept showing an identical ~3.5s hole right
+    there regardless. The actual cause was unrelated to threading or
+    blocking: calibration-phase samples were being kept as part of the
+    exported buffer (t0_native_ms was set at calibration's start), while
+    STATE_COUNTDOWN's samples are deliberately discarded (see
+    _flush_native_queue()) -- so the export always contained real
+    calibration data, then a real discarded window, back to back, and the
+    discarded window is what looked like unexplained missing data. Fixed
+    by excluding calibration-phase samples from the export entirely (see
+    start_calibration()/_collect_calibration_samples()) and setting
+    t0_native_ms here instead, once real recording starts -- the export
+    now begins at the actual "go" moment with nothing before it to create
+    a visible gap."""
     global state, calib_gravity, calib_deadzone_g, remote_stop_requested, _recording_session_id
 
     calib_gravity, calib_deadzone_g = compute_calibration_stats(calibration_samples, CALIBRATION_DEADZONE_SIGMA)
@@ -1061,13 +1108,7 @@ def main():
             if utime.ticks_diff(now, calibration_deadline_ms) >= 0:
                 finish_calibration_and_start_recording()
             else:
-                prev_count = sample_count
-                drain_samples()
-                for idx in range(prev_count, sample_count):
-                    calibration_samples.append((ax_buf[idx], ay_buf[idx], az_buf[idx]))
-                if sample_count >= MAX_SAMPLES:
-                    print("[state] buffer full, auto-disarming")
-                    disarm_recording()
+                _collect_calibration_samples()
 
         elif state == STATE_COUNTDOWN:
             # Deliberately not draining here -- see STATE_COUNTDOWN's

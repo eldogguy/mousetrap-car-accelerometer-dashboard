@@ -19,7 +19,19 @@
 #define SAMPLER_TASK_PRIORITY 5
 #define SAMPLER_TASK_STACK_WORDS 3072
 #define SAMPLER_TASK_CORE 1 // MP_TASK_COREID -- see sampler_task.h
-#define QUEUE_LEN 250       // 5s of headroom at 50Hz before a Python-side stall starts dropping samples
+// 20s of headroom at 50Hz before a Python-side stall starts dropping
+// samples. Was 250 (5s) -- raised after real hardware data showed every
+// recording losing a real, consistent ~3.5s of samples right around t=5s:
+// WiFi is fully deactivated during ARM_DELAY/CALIBRATING to avoid
+// disturbing that phase, so RECORDING's first remote-control poll has to
+// pay a full WiFi reassociation + TLS handshake (to the live Vercel
+// deployment) from cold, which reliably takes ~3.4-3.6s and blocks the
+// main thread's drain_samples() for that whole stretch (MicroPython
+// threads on this port share one core -- no true parallelism). 20s of
+// buffer comfortably covers that (plus POLL_WIFI_CONNECT_TIMEOUT_MS's own
+// 5s worst case) with real margin, at a trivial cost: 1000 * 28 bytes =
+// ~27KB.
+#define QUEUE_LEN 1000
 
 static const char *TAG = "imu_sampler";
 
