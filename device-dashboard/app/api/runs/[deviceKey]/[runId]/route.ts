@@ -1,5 +1,6 @@
 import { prisma } from "@/lib/prisma";
-import { parseImuCsv } from "@/lib/csv";
+import { parseImuCsv, motionToCsv } from "@/lib/csv";
+import { computeMotion } from "@/lib/motion";
 
 const DEVICE_KEY_RE = /^[0-9a-f]{5}$/i;
 
@@ -20,15 +21,16 @@ export async function GET(
     return Response.json({ error: "not found" }, { status: 404 });
   }
 
-  // ?format=csv streams back the exact bytes the device uploaded (not a
-  // re-serialization of the parsed JSON below) -- used by the dashboard's
-  // "Download CSV" button/link.
+  // ?format=csv returns the computed acceleration/velocity/displacement
+  // vs. time series (same numbers the dashboard's three main charts plot),
+  // not the raw per-axis device CSV -- used by the "Download CSV" link.
   const format = new URL(request.url).searchParams.get("format");
   if (format === "csv") {
-    return new Response(run.csvRaw, {
+    const motionCsv = motionToCsv(computeMotion(parseImuCsv(run.csvRaw)));
+    return new Response(motionCsv, {
       headers: {
         "Content-Type": "text/csv",
-        "Content-Disposition": `attachment; filename="${deviceKey}_run${id}.csv"`,
+        "Content-Disposition": `attachment; filename="${deviceKey}_run${id}_motion.csv"`,
       },
     });
   }

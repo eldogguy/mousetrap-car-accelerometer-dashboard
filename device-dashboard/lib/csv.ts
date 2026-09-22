@@ -1,3 +1,5 @@
+import type { MotionSample } from "@/lib/motion";
+
 export interface ImuRow {
   sampleIndex: number;
   timestampMs: number;
@@ -39,4 +41,23 @@ export function parseImuCsv(csv: string): ImuRow[] {
       yaw: c[13],
     };
   });
+}
+
+// The "Download CSV" export -- acceleration/velocity/displacement vs. time
+// along the car's direction of travel (+X, see FORWARD_SIGN in motion.ts),
+// the same series the dashboard's three main charts plot. Replaces the raw
+// per-axis device CSV (gyro/mag/roll/pitch/yaw), which isn't what a physics
+// write-up on this exercise actually needs.
+export function motionToCsv(samples: MotionSample[]): string {
+  const header = "time_s,acceleration_ms2,velocity_ms,displacement_m,interpolated";
+  const lines = samples.map((s) =>
+    [
+      s.timeS.toFixed(4),
+      s.accelForwardMs2.toFixed(6),
+      s.velForwardMs.toFixed(6),
+      s.posForwardM.toFixed(6),
+      s.interpolated ? "1" : "0",
+    ].join(",")
+  );
+  return [header, ...lines].join("\n") + "\n";
 }
