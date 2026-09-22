@@ -1,0 +1,33 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+// Get a free hosted Postgres database in seconds: `npx create-db`
+
+generator client {
+  provider = "prisma-client"
+  output   = "../app/generated/prisma"
+}
+
+datasource db {
+  provider = "sqlite"
+}
+
+model Device {
+  key            String   @id
+  createdAt      DateTime @default(now())
+  lastSeenAt     DateTime @updatedAt
+  pendingCommand String? // "arm" | "reset" | "export", cleared once the device polls it
+  lastKnownState String? // last state the device reported at check-in, e.g. "idle"
+  runs           Run[]
+}
+
+model Run {
+  id          Int      @id @default(autoincrement())
+  deviceKey   String
+  device      Device   @relation(fields: [deviceKey], references: [key], onDelete: Cascade)
+  csvRaw      String
+  sampleCount Int
+  uploadedAt  DateTime @default(now())
+
+  @@index([deviceKey, uploadedAt])
+}
