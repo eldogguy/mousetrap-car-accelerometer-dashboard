@@ -636,13 +636,27 @@ def upload_csv_over_wifi():
         sock.write(b"\r\n")
 
     upload_path = "%s/%s" % (SERVER_UPLOAD_PATH_PREFIX, device_key)
+    # Sends the gravity baseline + deadzone this experiment's own real,
+    # guaranteed-stationary STATE_CALIBRATING window computed (see
+    # finish_calibration_and_start_recording()) as headers, not as extra
+    # CSV rows/columns -- keeps the CSV body's format untouched so the
+    # dashboard's existing parser doesn't need to change, and lets the
+    # server treat this as pure metadata about the run rather than data
+    # to plot. Without this, the dashboard has to re-derive a baseline
+    # from the first few seconds of the recording itself, which silently
+    # produces a useless deadzone for any car that launches almost
+    # immediately (confirmed on real classroom data: a 0.68g deadzone
+    # from a "calibration window" that wasn't actually stationary).
+    bx, by, bz = calib_gravity
     request_headers = (
         "POST %s HTTP/1.1\r\n"
         "Host: %s\r\n"
         "Content-Type: text/csv\r\n"
+        "X-Calib-Gravity: %.6f,%.6f,%.6f\r\n"
+        "X-Calib-Deadzone: %.6f\r\n"
         "Transfer-Encoding: chunked\r\n"
         "Connection: close\r\n\r\n"
-    ) % (upload_path, SERVER_HOST)
+    ) % (upload_path, SERVER_HOST, bx, by, bz, calib_deadzone_g)
 
     try:
         sock.write(request_headers.encode())

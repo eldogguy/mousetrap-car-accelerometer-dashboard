@@ -86,40 +86,63 @@ function fillGaps(rows: ImuRow[]): FilledRow[] {
   return out;
 }
 
+export interface ProvidedCalibration {
+  gravity: [number, number, number];
+  deadzoneG: number;
+}
+
 // Mirrors analysis/analyze_run.py field-for-field: mean accel over the
 // first `calibrationSeconds` (by timestamp, not sample count) as the
 // gravity baseline; mean + deadzoneSigma*stddev of residual magnitude over
 // that same window as the deadzone threshold. Extends it with gap-filling
 // and trapezoidal integration to velocity/position -- keep in sync with
 // the Python version if either changes.
+//
+// This first-N-seconds approach is a fallback only -- it assumes the car
+// is still sitting still at the start of the exported recording, which is
+// true for a slow/bench-triggered run but false for a real launch that
+// takes off almost immediately (confirmed on real classroom data: a
+// contaminated "calibration window" produced a 0.68g deadzone, big enough
+// to zero out nearly the entire real signal). Pass `providedCalibration`
+// (the device's own baseline from its real, guaranteed-stationary
+// STATE_CALIBRATING window, stored per-run) whenever it's available to
+// skip this re-derivation entirely.
 export function computeMotion(
   rows: ImuRow[],
   calibrationSeconds = 5.0,
-  deadzoneSigma = 3.0
+  deadzoneSigma = 3.0,
+  providedCalibration?: ProvidedCalibration | null
 ): MotionSample[] {
   if (rows.length < 2) return [];
 
   const filled = fillGaps(rows);
 
   const t0 = filled[0].timestampMs;
-  const cutoffMs = t0 + calibrationSeconds * 1000;
-  const window = filled.filter((r) => r.timestampMs <= cutoffMs);
-  const calWindow = window.length > 0 ? window : filled.slice(0, 1);
+  let bx: number, by: number, bz: number, deadzoneG: number;
 
-  const n = calWindow.length;
-  const bx = calWindow.reduce((s, r) => s + r.accelX, 0) / n;
-  const by = calWindow.reduce((s, r) => s + r.accelY, 0) / n;
-  const bz = calWindow.reduce((s, r) => s + r.accelZ, 0) / n;
+  if (providedCalibration) {
+    [bx, by, bz] = providedCalibration.gravity;
+    deadzoneG = providedCalibration.deadzoneG;
+  } else {
+    const cutoffMs = t0 + calibrationSeconds * 1000;
+    const window = filled.filter((r) => r.timestampMs <= cutoffMs);
+    const calWindow = window.length > 0 ? window : filled.slice(0, 1);
 
-  const residuals = calWindow.map((r) => {
-    const cx = r.accelX - bx;
-    const cy = r.accelY - by;
-    const cz = r.accelZ - bz;
-    return Math.sqrt(cx * cx + cy * cy + cz * cz);
-  });
-  const meanR = residuals.reduce((a, b) => a + b, 0) / n;
-  const varR = residuals.reduce((a, r) => a + (r - meanR) ** 2, 0) / n;
-  const deadzoneG = meanR + deadzoneSigma * Math.sqrt(varR);
+    const n = calWindow.length;
+    bx = calWindow.reduce((s, r) => s + r.accelX, 0) / n;
+    by = calWindow.reduce((s, r) => s + r.accelY, 0) / n;
+    bz = calWindow.reduce((s, r) => s + r.accelZ, 0) / n;
+
+    const residuals = calWindow.map((r) => {
+      const cx = r.accelX - bx;
+      const cy = r.accelY - by;
+      const cz = r.accelZ - bz;
+      return Math.sqrt(cx * cx + cy * cy + cz * cz);
+    });
+    const meanR = residuals.reduce((a, b) => a + b, 0) / n;
+    const varR = residuals.reduce((a, r) => a + (r - meanR) ** 2, 0) / n;
+    deadzoneG = meanR + deadzoneSigma * Math.sqrt(varR);
+  }
 
   const out: MotionSample[] = [];
   let vx = 0, vy = 0, vz = 0;

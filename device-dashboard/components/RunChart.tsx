@@ -12,7 +12,7 @@ import {
 } from "chart.js";
 import { Line } from "react-chartjs-2";
 import type { ImuRow } from "@/lib/csv";
-import { computeMotion, type MotionSample } from "@/lib/motion";
+import { computeMotion, type MotionSample, type ProvidedCalibration } from "@/lib/motion";
 
 ChartJS.register(LinearScale, PointElement, LineElement, Tooltip, Legend, Filler);
 
@@ -140,6 +140,7 @@ function AxisChart({
 
 export default function RunChart({ deviceKey, runId }: { deviceKey: string; runId: number }) {
   const [rows, setRows] = useState<ImuRow[] | null>(null);
+  const [calibration, setCalibration] = useState<ProvidedCalibration | null>(null);
   const [error, setError] = useState<string | null>(null);
   const accelChartRef = useRef<LineChartRef>(null);
   const speedChartRef = useRef<LineChartRef>(null);
@@ -161,6 +162,7 @@ export default function RunChart({ deviceKey, runId }: { deviceKey: string; runI
   useEffect(() => {
     let cancelled = false;
     setRows(null);
+    setCalibration(null);
     setError(null);
     fetch(`/api/runs/${deviceKey}/${runId}`)
       .then((res) => {
@@ -168,7 +170,10 @@ export default function RunChart({ deviceKey, runId }: { deviceKey: string; runI
         return res.json();
       })
       .then((data) => {
-        if (!cancelled) setRows(data.rows);
+        if (!cancelled) {
+          setRows(data.rows);
+          setCalibration(data.calibration ?? null);
+        }
       })
       .catch((err) => {
         if (!cancelled) setError(String(err));
@@ -185,7 +190,7 @@ export default function RunChart({ deviceKey, runId }: { deviceKey: string; runI
     return <p className="text-sm text-zinc-500">Loading…</p>;
   }
 
-  const samples = computeMotion(rows);
+  const samples = computeMotion(rows, undefined, undefined, calibration);
   const interpolatedCount = samples.filter((s) => s.interpolated).length;
   const interpolatedNote =
     interpolatedCount > 0

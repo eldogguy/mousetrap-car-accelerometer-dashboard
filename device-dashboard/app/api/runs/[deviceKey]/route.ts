@@ -13,6 +13,31 @@ const DEVICE_KEY_RE = /^[0-9a-f]{5}$/i;
 const MAX_CSV_BYTES = 2 * 1024 * 1024;
 const MAX_RUNS_PER_DEVICE = 20;
 
+// Gravity baseline + deadzone from the device's own real, guaranteed-
+// stationary calibration window (see main.py's finish_calibration_and_
+// start_recording()), sent as headers rather than CSV columns so the
+// upload body's format stays untouched. Optional -- older firmware never
+// sent these, and a malformed/missing header just means the dashboard
+// falls back to deriving its own (less reliable) baseline from the data.
+function parseCalibHeaders(request: Request): {
+  calibGravityX: number | null;
+  calibGravityY: number | null;
+  calibGravityZ: number | null;
+  calibDeadzoneG: number | null;
+} {
+  const gravity = request.headers.get("x-calib-gravity");
+  const deadzone = request.headers.get("x-calib-deadzone");
+  const parts = gravity?.split(",").map(Number) ?? [];
+  const validGravity = parts.length === 3 && parts.every((n) => Number.isFinite(n));
+  const deadzoneNum = deadzone != null ? Number(deadzone) : NaN;
+  return {
+    calibGravityX: validGravity ? parts[0] : null,
+    calibGravityY: validGravity ? parts[1] : null,
+    calibGravityZ: validGravity ? parts[2] : null,
+    calibDeadzoneG: Number.isFinite(deadzoneNum) ? deadzoneNum : null,
+  };
+}
+
 export async function POST(
   request: Request,
   { params }: { params: Promise<{ deviceKey: string }> }
@@ -33,6 +58,7 @@ export async function POST(
   }
 
   const sampleCount = Math.max(0, csv.trim().split("\n").length - 1); // minus header
+  const calib = parseCalibHeaders(request);
 
   try {
     await prisma.$transaction(async (tx) => {
@@ -42,7 +68,7 @@ export async function POST(
         create: { key: deviceKey },
       });
       await tx.run.create({
-        data: { deviceKey, csvRaw: csv, sampleCount },
+        data: { deviceKey, csvRaw: csv, sampleCount, ...calib },
       });
 
       const staleRuns = await tx.run.findMany({

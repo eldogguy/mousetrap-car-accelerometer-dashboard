@@ -29,5 +29,17 @@ model Run {
   sampleCount Int
   uploadedAt  DateTime @default(now())
 
+  // Gravity baseline + deadzone the device itself computed during its real,
+  // guaranteed-stationary STATE_CALIBRATING window (5s, before the car ever
+  // launches) -- optional/nullable because older firmware never sent these
+  // and older runs never stored them. When present, computeMotion() uses
+  // them directly instead of re-deriving a baseline from the first N
+  // seconds of the exported recording, which silently breaks for a car
+  // that launches almost immediately (nothing left to calibrate against).
+  calibGravityX  Float?
+  calibGravityY  Float?
+  calibGravityZ  Float?
+  calibDeadzoneG Float?
+
   @@index([deviceKey, uploadedAt])
 }
